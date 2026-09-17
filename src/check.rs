@@ -7,7 +7,7 @@
 //! chain); with `--no-follow-redirects` a 3xx is reported as an *unfollowed*
 //! redirect.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -55,10 +55,16 @@ pub struct CheckOptions {
     pub follow_redirects: bool,
 }
 
-// reqwest's redirect policy runs on the calling worker thread, so a
-// thread-local captures the chain for the in-flight request without cross-talk.
-thread_local! {
-    static CHAIN: std::cell::RefCell<Vec<RedirectHop>> = const { std::cell::RefCell::new(Vec::new()) };
+// reqwest's blocking client may execute the redirect-policy closure on an
+// internal runtime thread rather than the calling worker thread, so a
+// thread-local cannot cross that boundary. Instead, the chain is recorded in a
+// shared map keyed by the *original* request URL, and each worker takes its own
+// URL's chain after the request returns. A `Mutex` guards the map because the
+// internal runtime thread writes it while worker threads read/remove entries.
+type ChainStore = Arc<Mutex<HashMap<String, Vec<RedirectHop>>>>;
+
+fn new_chain_store() -> ChainStore {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -68,22 +74,33 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-/// Build the blocking client for a run.
-fn build_client(options: &CheckOptions) -> Result<Client, String> {
+/// Build the blocking client for a run. `chains` is owned (not borrowed) so the
+/// redirect-policy closure may capture it (reqwest requires `Send + Sync +
+/// 'static` and an owned `Arc` satisfies that).
+fn build_client(options: &CheckOptions, chains: ChainStore) -> Result<Client, String> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(options.timeout_secs))
         .connect_timeout(Duration::from_secs(5))
         .user_agent(&options.user_agent);
     if options.follow_redirects {
-        // Custom policy records the chain while following up to 10 hops.
-        builder = builder.redirect(Policy::custom(|attempt| {
-            // Each invocation is one redirect: record `status` -> destination.
-            CHAIN.with(|c| {
-                c.borrow_mut().push(RedirectHop {
-                    status: attempt.status().as_u16(),
-                    url: attempt.url().to_string(),
-                });
-            });
+        // Custom policy records the chain (keyed by the original request URL)
+        // while following up to 10 hops.
+        builder = builder.redirect(Policy::custom(move |attempt| {
+            // Record `status` -> destination under the original URL.
+            let hop = RedirectHop {
+                status: attempt.status().as_u16(),
+                url: attempt.url().to_string(),
+            };
+            if let Some(orig) = attempt.previous().first() {
+                let key = orig.to_string();
+                let mut guard = lock(&chains);
+                match guard.get_mut(&key) {
+                    Some(v) => v.push(hop),
+                    None => {
+                        guard.insert(key, vec![hop]);
+                    }
+                }
+            }
             if attempt.previous().len() >= 10 {
                 attempt.error("too many redirects")
             } else {
@@ -96,17 +113,19 @@ fn build_client(options: &CheckOptions) -> Result<Client, String> {
     builder.build().map_err(|e| e.to_string())
 }
 
-fn take_chain() -> Vec<RedirectHop> {
-    CHAIN.with(|c| std::mem::take(&mut *c.borrow_mut()))
+/// Take and clear the recorded redirect chain for `url` (empty if none).
+fn take_chain(chains: &ChainStore, url: &str) -> Vec<RedirectHop> {
+    let key = url.to_string();
+    lock(chains).remove(&key).unwrap_or(vec![])
 }
 
 /// Perform one HTTP check, returning a typed result (never panics).
-fn check_one(client: &Client, url: &str, follow: bool) -> CheckResult {
+fn check_one(client: &Client, url: &str, follow: bool, chains: &ChainStore) -> CheckResult {
     let head = match client.head(url).send() {
         Ok(r) => r,
         Err(e) => return transport_error(url, e.to_string()),
     };
-    let mut chain = take_chain();
+    let mut chain = take_chain(chains, url);
     let mut status = head.status();
 
     // HEAD may be disallowed: retry once with GET and discard the body.
@@ -114,10 +133,10 @@ fn check_one(client: &Client, url: &str, follow: bool) -> CheckResult {
         status,
         StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED
     ) {
-        CHAIN.with(|c| c.borrow_mut().clear());
+        lock(chains).remove(&url.to_string());
         match client.get(url).send() {
             Ok(r) => {
-                chain.extend(take_chain());
+                chain.extend(take_chain(chains, url));
                 status = r.status();
             }
             Err(e) => return transport_error(url, e.to_string()),
@@ -176,7 +195,8 @@ pub fn check_all(urls: &[String], options: &CheckOptions, fail_fast: bool) -> Ve
     if urls.is_empty() {
         return Vec::new();
     }
-    let Ok(client) = build_client(options) else {
+    let chains = new_chain_store();
+    let Ok(client) = build_client(options, Arc::clone(&chains)) else {
         // A client build failure is a hard error surfaced per URL so nothing
         // panics and every result stays typed.
         return urls
@@ -198,6 +218,7 @@ pub fn check_all(urls: &[String], options: &CheckOptions, fail_fast: bool) -> Ve
             let cancel = Arc::clone(&cancel);
             let follow = options.follow_redirects;
             let client = client.clone();
+            let chains = Arc::clone(&chains);
             handles.push(scope.spawn(move || {
                 let _ = sid;
                 loop {
@@ -206,7 +227,7 @@ pub fn check_all(urls: &[String], options: &CheckOptions, fail_fast: bool) -> Ve
                     }
                     let url = { lock(&queue).pop_front() };
                     let Some(url) = url else { break };
-                    let res = check_one(&client, &url, follow);
+                    let res = check_one(&client, &url, follow, &chains);
                     let reportable = matches!(res.status, Status::Broken)
                         || (matches!(res.status, Status::Redirect) && res.redirect_unfollowed);
                     if fail_fast && reportable {
