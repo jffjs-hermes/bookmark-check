@@ -1,39 +1,22 @@
-use std::{env, fs, process};
-
-fn run(path: &str) -> Result<usize, String> {
-    let contents =
-        fs::read_to_string(path).map_err(|error| format!("failed to read {path}: {error}"))?;
-    Ok(contents.lines().count())
-}
+mod extract;
 
 fn main() {
-    let Some(path) = env::args().nth(1) else {
-        eprintln!("usage: bookmark-check <file.md>");
-        process::exit(2);
-    };
-
-    match run(&path) {
-        Ok(lines) => println!("parsed {lines} lines"),
-        Err(error) => {
-            eprintln!("{error}");
-            process::exit(1);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::run;
-    use std::fs;
-
-    #[test]
-    fn counts_lines() {
-        let path = std::env::temp_dir().join("bookmark-check-test.md");
-        fs::write(&path, "one\ntwo\nthree\n").expect("write fixture");
-        assert_eq!(
-            run(path.to_str().expect("utf-8 path")).expect("read fixture"),
-            3
+    let text = String::from("[a](https://example.com) <https://b.org> http://c.io");
+    let res = extract::extract("docs.md", text.as_str());
+    println!("occurrences: {}", res.occurrences.len());
+    for occ in res.occurrences.iter() {
+        println!(
+            "  {} @ {}:{}",
+            occ.url, occ.location.line, occ.location.column,
         );
-        fs::remove_file(path).expect("remove fixture");
     }
+    println!("malformed: {}", res.malformed.len());
+    for m in res.malformed.iter() {
+        println!(
+            "  {:?} {} @ {}:{}",
+            m.problem, m.url, m.location.line, m.location.column,
+        );
+    }
+    let uniq = extract::unique_urls(&res.occurrences);
+    println!("unique: {}", uniq.len());
 }
