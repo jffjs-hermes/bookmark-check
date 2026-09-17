@@ -55,8 +55,12 @@ Options:
 
 Exit codes:
 
-- `0` — all links healthy (or no links found)
-- `1` — one or more broken/redirect-problem links
+- `0` — all links healthy (or no links found). A followed redirect whose
+  final response is `2xx` is healthy (§6); it is reported as `REDIRECT` but
+  does not affect the exit code.
+- `1` — one or more `BROKEN` links. Under `--no-follow-redirects`, an
+  unfollowed `3xx` also yields exit `1` (the caller asked not to follow, so a
+  redirect is itself a reportable finding).
 - `2` — usage error (no file, unknown flag, invalid flag value, file not found/unreadable)
 
 Text output (default): one line per checked URL, e.g.
@@ -134,9 +138,8 @@ Client: `reqwest` blocking client, per-request configuration:
 - **Redirects**: follow up to 10 hops by default (matches browser behaviour).
   When following, record the redirect chain (status + location per hop).
   With `--no-follow-redirects`, a 3xx response is reported as
-  `REDIRECT (unfollowed)` with the `Location` header, and is treated as
-  neither broken nor healthy for exit-code purposes unless the redirect
-  target is also broken.
+  `REDIRECT (unfollowed)` with the `Location` header, and is treated as a
+  reportable finding for exit-code purposes (exit `1`, §3).
 - **Timeout**: connect timeout of 5s and total-request timeout of
   `--timeout` seconds (default 10). Timed-out requests are reported as
   `ERROR timeout`.
