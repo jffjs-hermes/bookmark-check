@@ -284,4 +284,42 @@ mod tests {
         let r = classify(100, vec![], true);
         assert_eq!(r.status, Status::Error);
     }
+
+    #[test]
+    fn transport_error_is_typed_without_http_status() {
+        let r = transport_error("https://x.example", "connection refused".to_string());
+        assert_eq!(r.status, Status::Error);
+        assert_eq!(r.http_status, None);
+        assert!(r.redirect_chain.is_empty());
+        assert!(!r.redirect_unfollowed);
+        assert_eq!(r.error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn redirect_chain_order_is_preserved() {
+        let chain = vec![
+            RedirectHop {
+                status: 301,
+                url: "https://hop1.example".into(),
+            },
+            RedirectHop {
+                status: 302,
+                url: "https://hop2.example".into(),
+            },
+        ];
+        let r = classify(200, chain, true);
+        assert_eq!(r.status, Status::Redirect);
+        assert!(!r.redirect_unfollowed);
+        assert_eq!(r.redirect_chain.len(), 2);
+        assert_eq!(r.redirect_chain[0].status, 301);
+        assert_eq!(r.redirect_chain[1].status, 302);
+    }
+
+    #[test]
+    fn redirect_unfollowed_flag_is_set_only_when_not_following() {
+        let unfollowed = classify(301, vec![], false);
+        assert!(unfollowed.redirect_unfollowed);
+        let followed = classify(301, vec![], true);
+        assert!(!followed.redirect_unfollowed);
+    }
 }
