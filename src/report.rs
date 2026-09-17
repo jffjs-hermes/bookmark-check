@@ -188,18 +188,22 @@ pub fn render_text(entries: &[Entry]) -> String {
                         e.url
                     ));
                 } else {
-                    let chain: Vec<String> = e
-                        .redirect_chain
-                        .iter()
-                        .map(|h| format!("{} -> {}", h.status, h.url))
-                        .collect();
-                    out.push_str(&format!(
-                        "REDIRECT {} {}\n",
+                    // SPEC §3: `<hop-status> -> <final-status> <src> -> <dest>...`
+                    // e.g. `REDIRECT 301 -> 200 https://old.example -> https://new.example`.
+                    let first = &e.redirect_chain[0];
+                    let mut line = format!(
+                        "REDIRECT {} -> {} {}",
+                        first.status,
                         e.http_status
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "-".to_string()),
-                        chain.join(" ")
-                    ));
+                        e.url
+                    );
+                    for h in &e.redirect_chain {
+                        line.push_str(&format!(" -> {}", h.url));
+                    }
+                    out.push_str(&line);
+                    out.push('\n');
                 }
             }
             Kind::Error => out.push_str(&format!(
@@ -456,5 +460,249 @@ mod tests {
         assert_eq!(parsed["summary"]["broken"], 1);
         assert_eq!(parsed["checks"][1]["status"], "broken");
         assert_eq!(parsed["checks"][1]["http_status"], 404);
+    }
+
+    // Entry helper that also sets an error reason (used for transport and
+    // malformed entries, whose labels differ from the default).
+    fn full_entry(
+        url: &str,
+        kind: Kind,
+        status: Option<u16>,
+        chain: Vec<RedirectHop>,
+        error: Option<&str>,
+    ) -> Entry {
+        Entry {
+            url: url.to_string(),
+            location: loc("a.md", 12, 5),
+            kind,
+            http_status: status,
+            redirect_chain: chain,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn text_output_matches_spec_examples() {
+        // SPEC §3 fixed line formats.
+        assert_eq!(
+            render_text(&[entry("https://example.com", Kind::Ok, Some(200), vec![])]),
+            "OK 200 https://example.com\n"
+        );
+        assert_eq!(
+            render_text(&[entry(
+                "https://example.com/missing",
+                Kind::Broken,
+                Some(404),
+                vec![]
+            )]),
+            "BROKEN 404 https://example.com/missing\n"
+        );
+        // Followed redirect: `REDIRECT <hop-status> -> <final> <src> -> <dest>`.
+        let red = vec![RedirectHop {
+            status: 301,
+            url: "https://new.example".into(),
+        }];
+        assert_eq!(
+            render_text(&[full_entry(
+                "https://old.example",
+                Kind::Redirect,
+                Some(200),
+                red,
+                None
+            )]),
+            "REDIRECT 301 -> 200 https://old.example -> https://new.example\n"
+        );
+        // Multi-hop chain preserves hop order.
+        let multi = vec![
+            RedirectHop {
+                status: 301,
+                url: "https://hop1.example".into(),
+            },
+            RedirectHop {
+                status: 302,
+                url: "https://hop2.example".into(),
+            },
+        ];
+        assert_eq!(
+            render_text(&[full_entry(
+                "https://src.example",
+                Kind::Redirect,
+                Some(200),
+                multi,
+                None
+            )]),
+            "REDIRECT 301 -> 200 https://src.example -> https://hop1.example -> https://hop2.example\n"
+        );
+        assert_eq!(
+            render_text(&[full_entry(
+                "https://10.0.0.1/",
+                Kind::Error,
+                None,
+                vec![],
+                Some("connection timed out")
+            )]),
+            "ERROR connection timed out https://10.0.0.1/\n"
+        );
+        assert_eq!(
+            render_text(&[full_entry(
+                "htp:/x",
+                Kind::Malformed,
+                None,
+                vec![],
+                Some("bad url")
+            )]),
+            r#"MALFORMED bad url "htp:/x" (a.md:12)"#.to_owned() + "\n"
+        );
+    }
+
+    #[test]
+    fn json_fixed_serialization_with_null_handling() {
+        // Transport error: http_status is null, error populated, chain empty.
+        let err = full_entry(
+            "https://10.0.0.1/",
+            Kind::Error,
+            None,
+            vec![],
+            Some("connection refused"),
+        );
+        let ok = entry("https://ok.example", Kind::Ok, Some(200), vec![]);
+        let files = vec!["docs.md".to_string()];
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(&files, &[ok, err])).expect("valid json");
+        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["files"], serde_json::json!(["docs.md"]));
+        // error entry: http_status null, error populated
+        let e = &parsed["checks"][1];
+        assert_eq!(e["status"], "error");
+        assert!(e["http_status"].is_null());
+        assert_eq!(e["error"], "connection refused");
+        assert_eq!(e["redirect_chain"], serde_json::json!([]));
+        // ok entry: http_status present, error null
+        let o = &parsed["checks"][0];
+        assert_eq!(o["status"], "ok");
+        assert_eq!(o["http_status"], 200);
+        assert!(o["error"].is_null());
+        // location shape: entries carry their own source file (a.md here)
+        assert_eq!(o["location"]["file"], "a.md");
+        assert_eq!(o["location"]["line"], 1);
+        assert_eq!(o["location"]["column"], 1);
+    }
+
+    #[test]
+    fn redirect_json_serializes_hops() {
+        let e = full_entry(
+            "https://old.example",
+            Kind::Redirect,
+            Some(200),
+            vec![RedirectHop {
+                status: 302,
+                url: "https://new.example".into(),
+            }],
+            None,
+        );
+        let files = vec![e.location.file.clone()];
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(&files, std::slice::from_ref(&e)))
+                .expect("valid json");
+        let c = &parsed["checks"][0];
+        assert_eq!(c["status"], "redirect");
+        assert_eq!(
+            c["redirect_chain"],
+            serde_json::json!([{ "status": 302, "url": "https://new.example" }])
+        );
+        // Following records the final status; error stays null for redirects.
+        assert_eq!(c["http_status"], 200);
+        assert!(c["error"].is_null());
+    }
+
+    #[test]
+    fn malformed_links_do_not_fail_exit_code() {
+        let entries = vec![
+            entry("https://ok.example", Kind::Ok, Some(200), vec![]),
+            full_entry("htp:/x", Kind::Malformed, None, vec![], Some("bad url")),
+            full_entry(
+                "http://",
+                Kind::Malformed,
+                None,
+                vec![],
+                Some("missing host"),
+            ),
+        ];
+        // Summary counts them, but exit code stays 0.
+        let s = summarize(&entries);
+        assert_eq!(s.malformed, 2);
+        assert_eq!(s.total, 3);
+        assert_eq!(exit_code(&entries), 0);
+    }
+
+    #[test]
+    fn exit_code_one_for_broken_and_unfollowed_redirect() {
+        // Broken yields 1.
+        assert_eq!(
+            exit_code(&[entry(
+                "https://bad.example",
+                Kind::Broken,
+                Some(404),
+                vec![]
+            )]),
+            1
+        );
+        // Unfollowed redirect (3xx, no chain) yields 1.
+        assert_eq!(
+            exit_code(&[entry(
+                "https://old.example",
+                Kind::Redirect,
+                Some(301),
+                vec![]
+            )]),
+            1
+        );
+        // Followed redirect ending 2xx stays healthy.
+        let red = RedirectHop {
+            status: 301,
+            url: "https://new.example".into(),
+        };
+        assert_eq!(
+            exit_code(&[full_entry(
+                "https://old.example",
+                Kind::Redirect,
+                Some(200),
+                vec![red],
+                None
+            )]),
+            0
+        );
+        // Errors alone do not fail the process (SPEC §8).
+        assert_eq!(
+            exit_code(&[full_entry(
+                "https://10.0.0.1/",
+                Kind::Error,
+                None,
+                vec![],
+                Some("timeout")
+            )]),
+            0
+        );
+    }
+
+    #[test]
+    fn quiet_prints_only_exit_code_visible_failures() {
+        let entries = vec![
+            entry("https://ok.example", Kind::Ok, Some(200), vec![]),
+            entry("https://bad.example", Kind::Broken, Some(404), vec![]),
+            entry("https://old.example", Kind::Redirect, Some(301), vec![]),
+            full_entry(
+                "https://10.0.0.1/",
+                Kind::Error,
+                None,
+                vec![],
+                Some("timeout"),
+            ),
+            full_entry("htp:/x", Kind::Malformed, None, vec![], Some("bad url")),
+        ];
+        assert_eq!(
+            render_quiet(&entries),
+            "BROKEN 404 https://bad.example\nREDIRECT 301 https://old.example\n"
+        );
     }
 }
