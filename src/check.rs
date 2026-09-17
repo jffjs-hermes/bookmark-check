@@ -55,11 +55,8 @@ pub struct CheckOptions {
     pub follow_redirects: bool,
 }
 
-// reqwest's redirect policy runs on the calling worker thread, so a
-// thread-local captures the chain for the in-flight request without cross-talk.
-thread_local! {
-    static CHAIN: std::cell::RefCell<Vec<RedirectHop>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Maximum redirects followed per URL (SPEC §6, browser behaviour).
+const MAX_REDIRECTS: usize = 10;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match m.lock() {
@@ -68,63 +65,111 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-/// Build the blocking client for a run.
+/// Build the blocking client for a run. Redirects are *not* handled by
+/// reqwest's own policy: we follow them manually in `check_one` so the chain
+/// is captured deterministically on this thread (reqwest's redirect closure
+/// runs on an internal runtime thread, so it cannot write a caller-owned
+/// buffer). `Policy::none` guarantees the response we see is the first hop.
 fn build_client(options: &CheckOptions) -> Result<Client, String> {
-    let mut builder = Client::builder()
+    Client::builder()
         .timeout(Duration::from_secs(options.timeout_secs))
         .connect_timeout(Duration::from_secs(5))
-        .user_agent(&options.user_agent);
-    if options.follow_redirects {
-        // Custom policy records the chain while following up to 10 hops.
-        builder = builder.redirect(Policy::custom(|attempt| {
-            // Each invocation is one redirect: record `status` -> destination.
-            CHAIN.with(|c| {
-                c.borrow_mut().push(RedirectHop {
-                    status: attempt.status().as_u16(),
-                    url: attempt.url().to_string(),
-                });
-            });
-            if attempt.previous().len() >= 10 {
-                attempt.error("too many redirects")
-            } else {
-                attempt.follow()
-            }
-        }));
-    } else {
-        builder = builder.redirect(Policy::none());
-    }
-    builder.build().map_err(|e| e.to_string())
+        .user_agent(&options.user_agent)
+        .redirect(Policy::none())
+        .build()
+        .map_err(|e| e.to_string())
 }
 
-fn take_chain() -> Vec<RedirectHop> {
-    CHAIN.with(|c| std::mem::take(&mut *c.borrow_mut()))
+/// One request against `url`: HEAD first, retrying once with GET when the
+/// server rejects HEAD (405/400/501). Returns the response status and, for a
+/// 3xx, the resolved `Location` destination. Never panics; a transport error
+/// is returned as `Err(message)` per URL.
+fn request_once(client: &Client, url: &str) -> Result<(StatusCode, Option<String>), String> {
+    let (status, location) = match client.head(url).send() {
+        Ok(r) => {
+            let s = r.status();
+            let loc = location_of(&r);
+            if matches!(
+                s,
+                StatusCode::METHOD_NOT_ALLOWED
+                    | StatusCode::BAD_REQUEST
+                    | StatusCode::NOT_IMPLEMENTED
+            ) {
+                // HEAD disallowed: retry once with GET and discard the body.
+                match client.get(url).send() {
+                    Ok(g) => (g.status(), location_of(&g)),
+                    Err(e) => return Err(e.to_string()),
+                }
+            } else {
+                (s, loc)
+            }
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok((status, location))
+}
+
+fn location_of(resp: &reqwest::blocking::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Resolve a possibly-relative `Location` against `base`. Returns a transport-
+/// style error message when it cannot be parsed.
+fn resolve_location(base: &str, location: &str) -> Result<String, String> {
+    match url::Url::parse(base).and_then(|u| u.join(location)) {
+        Ok(joined) => Ok(joined.to_string()),
+        Err(e) => Err(format!("invalid redirect location {location:?}: {e}")),
+    }
 }
 
 /// Perform one HTTP check, returning a typed result (never panics).
+///
+/// Redirects are followed manually (up to `MAX_REDIRECTS` hops) so the chain
+/// is captured in order on this thread. With `follow == false` the first 3xx
+/// is reported as an *unfollowed* redirect. A response past the hop cap yields
+/// a redirect finding rather than a transport error (the caller chose to
+/// follow and we record it as far as we can).
 fn check_one(client: &Client, url: &str, follow: bool) -> CheckResult {
-    let head = match client.head(url).send() {
-        Ok(r) => r,
-        Err(e) => return transport_error(url, e.to_string()),
-    };
-    let mut chain = take_chain();
-    let mut status = head.status();
+    let mut current = url.to_string();
+    let mut chain: Vec<RedirectHop> = Vec::new();
 
-    // HEAD may be disallowed: retry once with GET and discard the body.
-    if matches!(
-        status,
-        StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED
-    ) {
-        CHAIN.with(|c| c.borrow_mut().clear());
-        match client.get(url).send() {
-            Ok(r) => {
-                chain.extend(take_chain());
-                status = r.status();
+    for _ in 0..=MAX_REDIRECTS {
+        let (status, location) = match request_once(client, &current) {
+            Ok(x) => x,
+            Err(e) => return transport_error(url, e),
+        };
+
+        if status.is_redirection() {
+            if follow && chain.len() < MAX_REDIRECTS {
+                // Follow this hop only if a resolvable Location is present.
+                let dest = match location {
+                    Some(loc) => match resolve_location(&current, &loc) {
+                        Ok(d) => d,
+                        Err(e) => return transport_error(url, e),
+                    },
+                    // 3xx without Location: nothing to follow; report the
+                    // redirect as found (classify sets unfollowed=true when
+                    // follow is off).
+                    None => return classify(url, status, chain, follow),
+                };
+                chain.push(RedirectHop {
+                    status: status.as_u16(),
+                    url: dest.clone(),
+                });
+                current = dest;
+                continue;
             }
-            Err(e) => return transport_error(url, e.to_string()),
+            // Not following, or at the hop cap: report the redirect as found.
+            return classify(url, status, chain, follow);
         }
+
+        return classify(url, status, chain, follow);
     }
 
-    classify(url, status, chain, follow)
+    unreachable!("loop bounded by MAX_REDIRECTS")
 }
 
 /// Map an HTTP status + redirect chain into a typed result (SPEC §6).
